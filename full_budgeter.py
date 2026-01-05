@@ -137,7 +137,7 @@ def compute_bertscore_batch(preds, refs):
     if BERTSCORE_MODEL is None:
         BERTSCORE_MODEL = BERTScorer(model_type="microsoft/deberta-base-mnli", lang="en", rescale_with_baseline=True)
     
-    P, R, F1 = BERTSCORE_MODEL.score(preds, refs)
+    P, R, F1 = BERTSCORE_MODEL.score(preds, refs, batch_size=32))
     return F1.tolist()
 
 _sent = re.compile(r'(?<=[.?!])\s+')
