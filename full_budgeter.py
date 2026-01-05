@@ -125,6 +125,21 @@ def token_f1(pred, ref):
     rec = inter / len(rt)
     return 2 * prec * rec / (prec + rec)
 
+
+# BERTScoring
+BERTSCORE_MODEL = None
+
+def compute_bertscore_batch(preds, refs):
+    """Compute BERTScore for a batch of predictions and references."""
+    global BERTSCORE_MODEL
+    from bert_score import BERTScorer
+    
+    if BERTSCORE_MODEL is None:
+        BERTSCORE_MODEL = BERTScorer(model_type="microsoft/deberta-base-mnli", lang="en", rescale_with_baseline=True)
+    
+    P, R, F1 = BERTSCORE_MODEL.score(preds, refs)
+    return F1.tolist()
+
 _sent = re.compile(r'(?<=[.?!])\s+')
 
 def split_sentences(text):
@@ -444,7 +459,6 @@ def sliding_window_unitize(text, base_window=50, overlap_ratio=0.3):
 
 
 # Semantic Graph Algo
-
 def build_similarity_graph(sentences, sim_threshold=0.3, alpha=0.2, use_bert=True):
     n = len(sentences)
     if n == 0:
@@ -613,7 +627,10 @@ def run_pipeline(text, ref, B, unitization='sentence', selector='mmr',
 
 
 # Eval 
-def evaluate_mimic(df, budgets=[256, 512, 1024, 2048], n_samples=None, use_bert=False, use_llm=False):
+def evaluate_mimic(df, budgets=[256, 512, 1024, 2048], n_samples=None, use_bert=False, use_llm=False, use_bertscore=False):
+    import time
+    start_time = time.time()
+    
     if n_samples:
         df = df.sample(n=min(n_samples, len(df)))
     
@@ -621,13 +638,25 @@ def evaluate_mimic(df, budgets=[256, 512, 1024, 2048], n_samples=None, use_bert=
     selectors = ['lead', 'shuffled', 'mmr', 'facility']
     
     results = []
+    all_preds = []
+    all_refs = []
+    all_llm_preds = []
+    
+    n_docs = len(df)
+    n_configs = len(budgets) * (len(unitizations) * len(selectors) - 3)
     
     for i, (idx, row) in enumerate(df.iterrows()):
         text = str(row['input'])
         ref = str(row['target'])
         
         if i % 20 == 0:
-            print(f"Processing {i+1}/{len(df)}...")
+            elapsed = time.time() - start_time
+            if i > 0:
+                per_doc = elapsed / i
+                remaining = per_doc * (n_docs - i)
+                print(f"Processing {i+1}/{n_docs}... ({elapsed:.1f}s elapsed, ~{remaining:.1f}s remaining)")
+            else:
+                print(f"Processing {i+1}/{n_docs}...")
         
         for B in budgets:
             for unit in unitizations:
@@ -648,13 +677,42 @@ def evaluate_mimic(df, budgets=[256, 512, 1024, 2048], n_samples=None, use_bert=
                         'tF1': token_f1(pred, ref)
                     }
                     
+                    if use_bertscore:
+                        all_preds.append(pred if pred else " ")
+                        all_refs.append(ref)
+                    
                     if use_llm:
                         llm_pred = generate_summary_llm(pred, dataset='mimic')
                         result['r1_llm'] = rouge_f1(llm_pred, ref, 1)
                         result['r2_llm'] = rouge_f1(llm_pred, ref, 2)
                         result['tF1_llm'] = token_f1(llm_pred, ref)
+                        if use_bertscore:
+                            all_llm_preds.append(llm_pred if llm_pred else " ")
                     
                     results.append(result)
+    
+    selection_time = time.time() - start_time
+    print(f"Selection complete: {selection_time:.1f}s")
+    
+    # Compute BERTScore
+    if use_bertscore and all_preds:
+        print(f"Computing BERTScore for {len(all_preds)} extractive outputs...")
+        bert_start = time.time()
+        bert_scores = compute_bertscore_batch(all_preds, all_refs)
+        for i, score in enumerate(bert_scores):
+            results[i]['bertscore'] = score
+        print(f"Extractive BERTScore: {time.time() - bert_start:.1f}s")
+        
+        if use_llm and all_llm_preds:
+            print(f"Computing BERTScore for {len(all_llm_preds)} LLM outputs...")
+            bert_start = time.time()
+            bert_scores_llm = compute_bertscore_batch(all_llm_preds, all_refs)
+            for i, score in enumerate(bert_scores_llm):
+                results[i]['bertscore_llm'] = score
+            print(f"LLM BERTScore: {time.time() - bert_start:.1f}s")
+    
+    total_time = time.time() - start_time
+    print(f"Total runtime: {total_time:.1f}s ({total_time/60:.1f} min)")
     
     return pd.DataFrame(results)
 
@@ -712,23 +770,83 @@ def load_cochrane(filepath):
     return data
 
 
-def print_results(df):
-    grouped = df.groupby(['dataset', 'budget', 'unitization', 'selector']).mean(numeric_only=True)
+def print_results(df, out_dir=None):
+    from scipy import stats
     
-    print("Results")
+    print("Results (mean ± SE)")
+    
+    summary_rows = []
     
     for dataset in df['dataset'].unique():
         print(f"\n{dataset.upper()}")
         print("-"*80)
         
         subset = df[df['dataset'] == dataset]
+        
+        # Compute mean and SE for each group
+        def mean_se(x):
+            mean = x.mean()
+            se = stats.sem(x) if len(x) > 1 else 0
+            return f"{mean:.3f}±{se:.3f}"
+        
         pivot = subset.pivot_table(
             values='r1', 
             index=['unitization', 'selector'], 
             columns='budget',
-            aggfunc='mean'
+            aggfunc=mean_se
         )
-        print(pivot.round(3).to_string())
+        print(pivot.to_string())
+        
+        for (unit, sel), group in subset.groupby(['unitization', 'selector']):
+            for budget in subset['budget'].unique():
+                budget_group = group[group['budget'] == budget]
+                if len(budget_group) == 0:
+                    continue
+                    
+                row = {
+                    'dataset': dataset,
+                    'unitization': unit,
+                    'selector': sel,
+                    'budget': budget,
+                    'r1_mean': budget_group['r1'].mean(),
+                    'r1_se': stats.sem(budget_group['r1']) if len(budget_group) > 1 else 0,
+                    'r2_mean': budget_group['r2'].mean(),
+                    'r2_se': stats.sem(budget_group['r2']) if len(budget_group) > 1 else 0,
+                    'tF1_mean': budget_group['tF1'].mean(),
+                    'tF1_se': stats.sem(budget_group['tF1']) if len(budget_group) > 1 else 0,
+                }
+                
+                if 'r1_llm' in budget_group.columns:
+                    row['r1_llm_mean'] = budget_group['r1_llm'].mean()
+                    row['r1_llm_se'] = stats.sem(budget_group['r1_llm']) if len(budget_group) > 1 else 0
+                
+                if 'bertscore' in budget_group.columns:
+                    row['bertscore_mean'] = budget_group['bertscore'].mean()
+                    row['bertscore_se'] = stats.sem(budget_group['bertscore']) if len(budget_group) > 1 else 0
+                
+                if 'bertscore_llm' in budget_group.columns:
+                    row['bertscore_llm_mean'] = budget_group['bertscore_llm'].mean()
+                    row['bertscore_llm_se'] = stats.sem(budget_group['bertscore_llm']) if len(budget_group) > 1 else 0
+                
+                summary_rows.append(row)
+        
+        if 'r1_llm' in subset.columns:
+            print(f"\n{dataset.upper()} (LLM)")
+            print("-"*80)
+            pivot_llm = subset.pivot_table(
+                values='r1_llm', 
+                index=['unitization', 'selector'], 
+                columns='budget',
+                aggfunc=mean_se
+            )
+            print(pivot_llm.to_string())
+    
+    summary_df = pd.DataFrame(summary_rows)
+    if out_dir:
+        summary_path = os.path.join(out_dir, 'summary_with_se.csv')
+        summary_df.to_csv(summary_path, index=False)
+    
+    return summary_df
 
 
 if __name__ == "__main__":
@@ -741,6 +859,7 @@ if __name__ == "__main__":
     parser.add_argument('--max-docs', type=int, default=100)
     parser.add_argument('--use-bert', action='store_true')
     parser.add_argument('--use-llm', action='store_true')
+    parser.add_argument('--use-bertscore', action='store_true')
     parser.add_argument('--out', type=str, default='results')
     args = parser.parse_args()
     
@@ -748,12 +867,12 @@ if __name__ == "__main__":
     
     if args.dataset == 'mimic':
         df = pd.read_csv(args.input, on_bad_lines='skip', engine='python')
-        results = evaluate_mimic(df, budgets=budgets, n_samples=args.max_docs, use_bert=args.use_bert, use_llm=args.use_llm)
+        results = evaluate_mimic(df, budgets=budgets, n_samples=args.max_docs, use_bert=args.use_bert, use_llm=args.use_llm, use_bertscore=args.use_bertscore)
     else:
         data = load_cochrane(args.input)
         results = evaluate_cochrane(data, budgets=budgets, n_samples=args.max_docs, use_bert=args.use_bert)
     
-    print_results(results)
+    print_results(results, out_dir=args.out)
     
     os.makedirs(args.out, exist_ok=True)
     results.to_csv(os.path.join(args.out, f'{args.dataset}_results.csv'), index=False)
